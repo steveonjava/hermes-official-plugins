@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Tell the host the request is alive while native streams events that carry no text (tool-call arguments as `input_json_delta`, thinking signatures, block boundaries). Hermes' stale detector only sees chunks, so a long tool call used to look like a stall and the host cancelled a healthy request at its stale budget, then replayed it (#35). Each such event now yields a content-free chunk; pings do not, since they show an open connection and not model work. Final responses are unchanged.
 - Keep one native session per conversation (`--session-id` from the system prompt and first frame): with feature flags on, native names a per-session scratchpad directory in the environment message after the first user turn, so a new session per spawn changed it on every request and each round re-wrote the conversation to the prompt cache.
 - Short model names such as `sonnet-5-5`, `sonnet-5.5`, `opus-4.8` and `haiku-4-5` resolve to their pinned routes (and thinking policy) instead of reaching Claude Code verbatim and 404ing into the fallback chain (#103).
 - `/usage` asks Claude Code for the plan limits (`get_usage` control request) instead of reading its login: it now works with `auth.adopt_external_logins: false`, follows the per-profile `claude_config_dir`, and the plugin never holds the CLI's token (#82).
