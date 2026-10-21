@@ -66,6 +66,8 @@ def traced(tmp_path, monkeypatch):
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
     mod.register(PluginContext(PluginManifest(name="langfuse"), PluginManager()))
     mod._TRACE_STATE.clear()
+    mod._SENDER_BY_TURN.clear()
+    mod._USER_BY_CHILD_SESSION.clear()
     return mod, roots, propagated, home
 
 
@@ -130,6 +132,64 @@ def test_cron_run_is_tagged_with_its_stable_job_id(traced):
     finally:
         exit_cron_execution(token)
     assert propagated[0]["tags"] == ["hermes", "langfuse", "platform:cron", "trigger:cron", "cron-job:test-job"]
+
+
+# End-user attribution: Langfuse userId is the messaging sender (hermes-agent#44639).
+
+def _announce_turn(mod, session="s1", sender="@alice:example.org"):
+    """The turn-scoped pre_llm_call: no API messages, but it is the hook that names the sender."""
+    mod.on_pre_llm_call(session_id=session, task_id=session, turn_id=f"{session}:t1", platform="matrix",
+                        user_message="hi", conversation_history=[], sender_id=sender)
+
+
+def test_gateway_turn_is_attributed_to_its_sender(traced):
+    mod, roots, propagated, _ = traced
+    _announce_turn(mod)
+    assert roots == []  # the turn-scoped hook must still not open an orphan root
+    _open_turn(mod, platform="matrix")
+    assert propagated[0]["user_id"] == "@alice:example.org"
+    assert propagated[0]["metadata"] == {"profile": "default"}
+
+
+def test_senderless_turn_leaves_user_unset(traced):
+    mod, _, propagated, _ = traced
+    _announce_turn(mod, sender="")
+    _open_turn(mod)
+    assert "user_id" not in propagated[0]
+
+
+def test_sender_does_not_leak_into_the_next_turn(traced):
+    mod, _, propagated, _ = traced
+    _announce_turn(mod)
+    _open_turn(mod)
+    mod._finish_trace(mod._trace_key("s1", "s1", turn_id="s1:t1"))
+    assert mod._SENDER_BY_TURN == {}
+    mod.on_pre_llm_request(task_id="s1", session_id="s1", model="m", provider="p", api_mode="chat", api_call_count=1,
+                           request_messages=[{"role": "user", "content": "hi"}],
+                           turn_id="s1:t2", api_request_id="s1:t2:api:1")
+    assert "user_id" not in propagated[-1]
+
+
+def test_subagent_traces_inherit_the_spawning_user(traced):
+    mod, _, propagated, _ = traced
+    _announce_turn(mod)
+    _open_turn(mod, platform="matrix")
+    mod.on_subagent_start(parent_turn_id="s1:t1", child_session_id="child-1", child_role="leaf", child_goal="go")
+    mod.on_pre_llm_request(task_id="child-1", session_id="child-1", platform="subagent", model="m", provider="p",
+                           api_mode="chat", api_call_count=1, request_messages=[{"role": "user", "content": "go"}],
+                           turn_id="child-1:t1", api_request_id="child-1:t1:api:1")
+    assert propagated[-1]["session_id"] == "child-1" and propagated[-1]["user_id"] == "@alice:example.org"
+    mod.on_subagent_stop(parent_turn_id="s1:t1", child_session_id="child-1", child_role="leaf")
+    assert mod._USER_BY_CHILD_SESSION == {}
+
+
+def test_sender_stash_is_bounded(traced, monkeypatch):
+    mod, _, _, _ = traced
+    monkeypatch.setattr(mod, "_MAX_TRACE_STATE", 4)
+    mod._SENDER_BY_TURN.clear()
+    for i in range(10):
+        mod.on_pre_llm_call(session_id="s", turn_id=f"s:t{i}", sender_id=f"u{i}")
+    assert list(mod._SENDER_BY_TURN) == ["s:t6", "s:t7", "s:t8", "s:t9"]
 
 
 # Responses API tool items in generation input (hermes-agent#84186).
